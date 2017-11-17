@@ -52,3 +52,30 @@ Implement a parameter server with mpi4py
 
 ## Resources
 * Good summary of parameter servers at http://hunch.net/?p=151364
+
+## Async PS psuedo-code
+* This is algorithm AsySG-InCon (for inconsistent reads) in [1]
+* [1]:Asynchronous parallel stochastic gradient for nonconvex optimization,
+  https://arxiv.org/abs/1506.08272
+
+``` python
+# optimizaiton step function
+irequest_params()
+for p in params:
+    if rank == 0:
+        comms = []
+        while True:
+            comms += [recv(MPI.ANY_SOURCE)]
+            if len(comms) == 32:
+                break
+        params = [receive(comm) for comm in comms]
+        p = sum(params)
+        step()
+    else:
+        send(param, 0)
+    req = ibcast(p.data)
+```
+
+It's easy to impelment inconsistent reads with `ibcast`. It's harder to do
+consistent reads; we need to do a buffered broadcast to allow workers to
+continue to compute gradients.
