@@ -24,7 +24,8 @@ def igather(obj, name=""):
     global max_bytes
     pickled = pickle.dumps(obj)
     send = bytearray(pickled)
-    max_bytes[name] = max(max_bytes.get(name, 0), len(send)) * 100
+    max_bytes[name] = max(max_bytes.get(name, 0), len(send) * 1000)
+    max_bytes[name] = max(max_bytes[name], 1024*1024)
     recv = bytearray(max_bytes[name] * size)
     req = comm.Igatherv([send, MPI.BYTE], [recv, MPI.BYTE])
     return recv, req
