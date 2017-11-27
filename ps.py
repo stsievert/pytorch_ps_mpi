@@ -56,7 +56,7 @@ class MPI_PS(torch.optim.SGD):
 
         self.steps += 1
         data = {'grad_comm_time': 0, 'msg_size': 0, 'step': self.steps,
-                'encode_time': 0, 'decode_time': 0}
+                'encode_time': 0, 'decode_time': 0, 'param_compute_time': 0}
         for_loop_start = time.time()
         for group in self.param_groups:
             weight_decay = group['weight_decay']
@@ -85,6 +85,7 @@ class MPI_PS(torch.optim.SGD):
                     grad = [self.decode(code, rescale=self.rescale)
                             for code in codes]
                     data['decode_time'] += time.time() - start
+                    start = time.time()
                     d_p = sum(grad)
 
                     if p.grad is None:
@@ -106,6 +107,7 @@ class MPI_PS(torch.optim.SGD):
                             d_p = buf
 
                     p.data.add_(-group['lr'], d_p)
+                    data['param_compute_time'] += time.time() - start
                 sent_msgs += [comms.ibroadcast(p.data)]
             data['param_comm_time'] = 0
             for sent_msg, p in zip(sent_msgs, group['params']):
