@@ -6,6 +6,8 @@ sys.path.append(__dir__)
 import mpi_comms as comms
 from mpi4py import MPI
 
+use_mpi = False
+
 
 def _bytes_of(obj):
     # BUG: for 2D arrays doesn't return the number of bytes
@@ -42,6 +44,7 @@ class MPI_PS(torch.optim.SGD):
         self.rank = comm.Get_rank()
         self.size = comm.Get_size()
         self.steps = 0
+        assert not (svd_rank == 0 and not rescale)
         super(MPI_PS, self).__init__(*args, **kwargs)
 
     def step(self, closure=None):
@@ -71,22 +74,27 @@ class MPI_PS(torch.optim.SGD):
                                   svd_rank=self.svd_rank,
                                   random_sample=self.rescale)
                 data['encode_time'] += time.time() - start
-
-                recv_msgs += [comms.igather(msg, name=i)]
+                if use_mpi:
+                    recv_msgs += [comms.igather(msg, name=i)]
+                else:
+                    recv_msgs += [msg]
 
             sent_msgs = []
             for i, (recv_msg, p) in enumerate(zip(recv_msgs, group['params'])):
                 if self.rank == 0:
                     start = time.time()
-                    codes = comms.irecv(*recv_msg, name=i)
-                    data['grad_comm_time'] += time.time() - start
-                    data['msg_size'] += _bytes_of(codes)
-                    start = time.time()
-                    grad = [self.decode(code, rescale=self.rescale)
-                            for code in codes]
-                    data['decode_time'] += time.time() - start
-                    start = time.time()
-                    d_p = sum(grad)
+                    if use_mpi:
+                        codes = comms.irecv(*recv_msg, name=i)
+                        data['grad_comm_time'] += time.time() - start
+                        data['msg_size'] += _bytes_of(codes)
+                        start = time.time()
+                        grad = [self.decode(code, rescale=self.rescale)
+                                for code in codes]
+                        data['decode_time'] += time.time() - start
+                        start = time.time()
+                        d_p = sum(grad)
+                    else:
+                        d_p = self.decode(recv_msg)
 
                     if p.grad is None:
                         continue
@@ -108,12 +116,14 @@ class MPI_PS(torch.optim.SGD):
 
                     p.data.add_(-group['lr'], d_p)
                     data['param_compute_time'] += time.time() - start
-                sent_msgs += [comms.ibroadcast(p.data)]
-            data['param_comm_time'] = 0
-            for sent_msg, p in zip(sent_msgs, group['params']):
-                start = time.time()
-                p.data = comms.irecv1(*sent_msg)
-                data['param_comm_time'] += time.time() - start
+                if use_mpi:
+                    sent_msgs += [comms.ibroadcast(p.data)]
+            if use_mpi:
+                data['param_comm_time'] = 0
+                for sent_msg, p in zip(sent_msgs, group['params']):
+                    start = time.time()
+                    p.data = comms.irecv1(*sent_msg)
+                    data['param_comm_time'] += time.time() - start
 
         data['total_time'] = time.time() - for_loop_start
         return loss, data
