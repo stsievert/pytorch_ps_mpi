@@ -32,19 +32,20 @@ def _bytes_of(obj):
 
 class MPI_PS(torch.optim.SGD):
     def __init__(self, *args,
-                 encode=None, decode=None, rescale=True, svd_rank=0,
+                 encode=None, decode=None, #rescale=True, svd_rank=0,
+                 encode_kwargs={},
                  **kwargs):
         self.encode = encode
         self.decode = decode
-        self.compress = kwargs.pop('compress', False)
-        self.rescale = rescale
-        self.svd_rank = svd_rank
+        #  self.compress = kwargs.pop('compress', False)
+        #  self.rescale = rescale
+        #  self.svd_rank = svd_rank
+        self.encode_kwargs = encode_kwargs
 
         comm = MPI.COMM_WORLD
         self.rank = comm.Get_rank()
         self.size = comm.Get_size()
         self.steps = 0
-        assert not (svd_rank == 0 and not rescale)
         super(MPI_PS, self).__init__(*args, **kwargs)
 
     def step(self, closure=None):
@@ -70,9 +71,7 @@ class MPI_PS(torch.optim.SGD):
             recv_msgs = []
             for i, param in enumerate(group['params']):
                 start = time.time()
-                msg = self.encode(param.grad.data, compress=self.compress,
-                                  svd_rank=self.svd_rank,
-                                  random_sample=self.rescale)
+                msg = self.encode(param.grad.data, **self.encode_kwargs)
                 data['encode_time'] += time.time() - start
                 if use_mpi:
                     recv_msgs += [comms.igather(msg, name=i)]
@@ -88,8 +87,7 @@ class MPI_PS(torch.optim.SGD):
                         data['grad_comm_time'] += time.time() - start
                         data['msg_size'] += _bytes_of(codes)
                         start = time.time()
-                        grad = [self.decode(code, rescale=self.rescale)
-                                for code in codes]
+                        grad = [self.decode(code) for code in codes]
                         data['decode_time'] += time.time() - start
                         start = time.time()
                         d_p = sum(grad)
