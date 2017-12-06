@@ -6,8 +6,6 @@ sys.path.append(__dir__)
 import mpi_comms as comms
 from mpi4py import MPI
 
-use_mpi = False
-
 
 def _bytes_of(obj):
     # BUG: for 2D arrays doesn't return the number of bytes
@@ -32,15 +30,17 @@ def _bytes_of(obj):
 
 class MPI_PS(torch.optim.SGD):
     def __init__(self, *args,
-                 encode=None, decode=None, #rescale=True, svd_rank=0,
-                 encode_kwargs={},
+                 encode=None, decode=None, names=[],
+                 encode_kwargs={}, use_mpi=True,
                  **kwargs):
         self.encode = encode
         self.decode = decode
+        self.use_mpi = use_mpi
         #  self.compress = kwargs.pop('compress', False)
         #  self.rescale = rescale
         #  self.svd_rank = svd_rank
         self.encode_kwargs = encode_kwargs
+        self.names = names
 
         comm = MPI.COMM_WORLD
         self.rank = comm.Get_rank()
@@ -60,40 +60,55 @@ class MPI_PS(torch.optim.SGD):
 
         self.steps += 1
         data = {'grad_comm_time': 0, 'msg_size': 0, 'step': self.steps,
-                'encode_time': 0, 'decode_time': 0, 'param_compute_time': 0}
+                'encode_time': 0, 'decode_time': 0, 'param_compute_time': 0,
+                'grad_sum_time': 0, 'rank': self.rank, 'world_size': self.size,
+                'igather_time': 0, 'ibroadcast_time': 0}
         for_loop_start = time.time()
         for group in self.param_groups:
             weight_decay = group['weight_decay']
             momentum = group['momentum']
             dampening = group['dampening']
             nesterov = group['nesterov']
+            assert len(self.names) == len(group['params'])
 
             recv_msgs = []
             for i, param in enumerate(group['params']):
                 start = time.time()
                 msg = self.encode(param.grad.data, **self.encode_kwargs)
                 data['encode_time'] += time.time() - start
-                if use_mpi:
-                    recv_msgs += [comms.igather(msg, name=i)]
+                start = time.time()
+                if self.use_mpi:
+                    *r, igather_data = comms.igather(msg, name=i)
+                    recv_msgs += [r]
+                    data.update({'igather_' + k: v for k, v in igather_data.items()})
                 else:
                     recv_msgs += [msg]
+                data['igather_time'] += time.time() - start
 
             sent_msgs = []
             for i, (recv_msg, p) in enumerate(zip(recv_msgs, group['params'])):
                 if self.rank == 0:
-                    start = time.time()
-                    if use_mpi:
+                    if self.use_mpi:
+                        start = time.time()
                         codes = comms.irecv(*recv_msg, name=i)
                         data['grad_comm_time'] += time.time() - start
                         data['msg_size'] += _bytes_of(codes)
+
                         start = time.time()
                         grad = [self.decode(code) for code in codes]
                         data['decode_time'] += time.time() - start
-                        start = time.time()
-                        d_p = sum(grad)
                     else:
-                        d_p = self.decode(recv_msg)
+                        data['grad_comm_time'] += 1e-6
+                        data['msg_size'] += _bytes_of(recv_msg)
+                        start = time.time()
+                        grad = [self.decode(recv_msg)]
+                        data['decode_time'] += time.time() - start
 
+                    start = time.time()
+                    d_p = sum(grad)
+                    data['grad_sum_time'] += time.time() - start
+
+                    start = time.time()
                     if p.grad is None:
                         continue
                     #  d_p = p.grad.data
@@ -114,14 +129,16 @@ class MPI_PS(torch.optim.SGD):
 
                     p.data.add_(-group['lr'], d_p)
                     data['param_compute_time'] += time.time() - start
-                if use_mpi:
+                start = time.time()
+                if self.use_mpi:
                     sent_msgs += [comms.ibroadcast(p.data)]
-            if use_mpi:
-                data['param_comm_time'] = 0
+                data['ibroadcast_time'] += time.time() - start
+            data['param_comm_time'] = 0
+            if self.use_mpi:
                 for sent_msg, p in zip(sent_msgs, group['params']):
                     start = time.time()
                     p.data = comms.irecv1(*sent_msg)
-                    data['param_comm_time'] += time.time() - start
+            data['param_comm_time'] += time.time() - start
 
-        data['total_time'] = time.time() - for_loop_start
+        data['opt_time'] = time.time() - for_loop_start
         return loss, data
