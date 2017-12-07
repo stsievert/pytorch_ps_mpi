@@ -31,7 +31,7 @@ def _bytes_of(obj):
 class MPI_PS(torch.optim.SGD):
     def __init__(self, *args,
                  encode=None, decode=None, names=[],
-                 encode_kwargs={}, use_mpi=True,
+                 encode_kwargs={}, use_mpi=True, cuda=False,
                  **kwargs):
         self.encode = encode
         self.decode = decode
@@ -41,6 +41,7 @@ class MPI_PS(torch.optim.SGD):
         #  self.svd_rank = svd_rank
         self.encode_kwargs = encode_kwargs
         self.names = names
+        self.cuda = cuda
 
         comm = MPI.COMM_WORLD
         self.rank = comm.Get_rank()
@@ -71,26 +72,29 @@ class MPI_PS(torch.optim.SGD):
             nesterov = group['nesterov']
             assert len(self.names) == len(group['params'])
 
-            recv_msgs = []
-            for i, param in enumerate(group['params']):
+            recv_msgs = {}
+            igather_data = []
+            for name, param in zip(self.names, group['params']):
                 start = time.time()
                 msg = self.encode(param.grad.data, **self.encode_kwargs)
                 data['encode_time'] += time.time() - start
                 start = time.time()
                 if self.use_mpi:
-                    *r, igather_data = comms.igather(msg, name=i)
-                    recv_msgs += [r]
-                    data.update({'igather_' + k: v for k, v in igather_data.items()})
+                    *r, igather_datum = comms.igather(msg, name=name)
+                    recv_msgs[name] = r
+                    igather_data += [{'name': name, **igather_datum}]
                 else:
-                    recv_msgs += [msg]
+                    recv_msgs[name] = msg
+                    igather_data = []
                 data['igather_time'] += time.time() - start
+            data['igather_data'] = igather_data
 
             sent_msgs = []
-            for i, (recv_msg, p) in enumerate(zip(recv_msgs, group['params'])):
+            for ((name, recv_msg), p) in zip(recv_msgs.items(), group['params']):
                 if self.rank == 0:
                     if self.use_mpi:
                         start = time.time()
-                        codes = comms.irecv(*recv_msg, name=i)
+                        codes = comms.irecv(*recv_msg, name=name, cuda=self.cuda)
                         data['grad_comm_time'] += time.time() - start
                         data['msg_size'] += _bytes_of(codes)
 
@@ -137,7 +141,7 @@ class MPI_PS(torch.optim.SGD):
             if self.use_mpi:
                 for sent_msg, p in zip(sent_msgs, group['params']):
                     start = time.time()
-                    p.data = comms.irecv1(*sent_msg)
+                    p.data = comms.irecv1(*sent_msg, cuda=self.cuda)
             data['param_comm_time'] += time.time() - start
 
         data['opt_time'] = time.time() - for_loop_start

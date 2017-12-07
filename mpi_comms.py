@@ -1,9 +1,11 @@
-import pickle
-import zlib
-from mpi4py import MPI
-import numpy as np
-import blosc
 import time
+import pickle
+import functools
+import zlib
+import blosc
+from mpi4py import MPI
+import torch
+import numpy as np
 
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
@@ -14,6 +16,34 @@ max_bytes = {}
 LEVEL = 2
 METHOD = 'snappy'
 
+
+def to_np(d):
+    if isinstance(d, torch.Tensor):
+        if d.is_cuda:
+            d.cpu()
+        return d.numpy()
+    if isinstance(d, dict):
+        return {k: to_np(v) for k, v in d.items()}
+    if isinstance(d, list):
+        return list(map(to_np, d))
+    if isinstance(d, map):
+        return map(to_np, d)
+    return d
+
+
+def to_torch(d, cuda=False):
+    if isinstance(d, np.ndarray):
+        d = torch.Tensor(d)
+        if cuda:
+            d = d.cuda()
+        return d
+    if isinstance(d, dict):
+        return {k: to_torch(v) for k, v in d.items()}
+    if isinstance(d, list):
+        return list(map(to_torch, d))
+    if isinstance(d, map):
+        return map(to_torch, d)
+    return d
 
 def igather(obj, name=""):
     """
@@ -27,6 +57,7 @@ def igather(obj, name=""):
         Supports req.Wait function
     """
     global max_bytes
+    obj = to_np(obj)
     t = [time.time()]
     pickled = pickle.dumps(obj)
     t += [time.time()]
@@ -43,7 +74,9 @@ def igather(obj, name=""):
     req = comm.Igatherv([send, MPI.BYTE], [recv, MPI.BYTE])
     t += [time.time()]
     return recv, req, {'pickle_time': t[1] - t[0], 'compress_time': t[2] - t[1],
-                       'igather_time': t[4] - t[3]}
+                       'alloc_time': t[3] - t[2],
+                       'igather_time': t[4] - t[3], 'level': LEVEL,
+                       'method': METHOD, 'alloc_bytes': max_bytes[name]}
 
 
 def trim_msg(msg):
@@ -55,7 +88,7 @@ def trim_msg(msg):
     return msg[:i]
 
 
-def irecv(recv, req, name=""):
+def irecv(recv, req, name="", cuda=False):
     global max_bytes
     if rank == 0:
         req.Wait()
@@ -64,16 +97,19 @@ def irecv(recv, req, name=""):
         msgs = map(trim_msg, msgs)
         msgs = map(blosc.decompress, msgs)
         objs = map(pickle.loads, msgs)
+        objs = map(functools.partial(to_torch, cuda=cuda), objs)
         return list(objs)
 
 
-def irecv1(recv, req):
+def irecv1(recv, req, cuda=False):
     req.Wait()
     recv = blosc.decompress(recv)
-    return pickle.loads(recv)
+    obj = pickle.loads(recv)
+    return to_torch(obj, cuda=cuda)
 
 
 def ibroadcast(obj):
+    obj = to_np(obj)
     pickled = pickle.dumps(obj)
     send = bytearray(pickled)
     send = blosc.compress(send, clevel=LEVEL, cname=METHOD)
@@ -88,7 +124,7 @@ if __name__ == "__main__":
     obj_hat = irecv1(*r)
     assert obj_hat == obj
 
-    r = igather(obj, name="test")
+    *r, data = igather(obj, name="test")
     if rank == 0:
         objs = irecv(*r, name="test")
         for obj_hat in objs:
