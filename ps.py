@@ -76,7 +76,7 @@ class MPI_PS(torch.optim.SGD):
             igather_data = []
             for name, param in zip(self.names, group['params']):
                 start = time.time()
-                msg = self.encode(param.grad.data, **self.encode_kwargs)
+                msg = self.encode(param.grad.data, cuda=self.cuda, **self.encode_kwargs)
                 data['encode_time'] += time.time() - start
                 start = time.time()
                 if self.use_mpi:
@@ -99,13 +99,13 @@ class MPI_PS(torch.optim.SGD):
                         data['msg_size'] += _bytes_of(codes)
 
                         start = time.time()
-                        grad = [self.decode(code) for code in codes]
+                        grad = [self.decode(code, cuda=self.cuda) for code in codes]
                         data['decode_time'] += time.time() - start
                     else:
                         data['grad_comm_time'] += 1e-6
                         data['msg_size'] += _bytes_of(recv_msg)
                         start = time.time()
-                        grad = [self.decode(recv_msg)]
+                        grad = [self.decode(recv_msg, cuda=self.cuda)]
                         data['decode_time'] += time.time() - start
 
                     start = time.time()
