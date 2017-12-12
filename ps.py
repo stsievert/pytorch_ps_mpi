@@ -1,5 +1,7 @@
 import torch
 import time
+from functools import partial
+from toolz import reduce
 import sys
 __dir__ = "/".join(__file__.split('/')[:-1])
 sys.path.append(__dir__)
@@ -29,10 +31,13 @@ def _bytes_of(obj):
 
 
 class MPI_PS(torch.optim.SGD):
-    def __init__(self, *args,
+    def __init__(self, named_params, *args,
                  encode=None, decode=None, names=[],
                  encode_kwargs={}, use_mpi=True, cuda=False,
                  **kwargs):
+        for name, param in named_params:
+            param.register_hook(partial(self.send_grad, name=name))
+            param.name = name
         self.encode = encode
         self.decode = decode
         self.use_mpi = use_mpi
@@ -48,6 +53,21 @@ class MPI_PS(torch.optim.SGD):
         self.size = comm.Get_size()
         self.steps = 0
         super(MPI_PS, self).__init__(*args, **kwargs)
+
+        self.recv_msgs = {}
+        self.timings = []
+
+    def send_grad(self, grad, name=None):
+        msg, datum = self.encode(grad.data, cuda=self.cuda, **self.encode_kwargs)
+        datum = {'encode_' + k: v for k, v in datum.items()}
+        if self.use_mpi:
+            *r, igather_datum = comms.igather(msg, name=name)
+            self.recv_msgs[name] = r
+        else:
+            self.recv_msgs[name] = msg
+            igather_datum = {}
+        datum.update(igather_datum)
+        self.timings += [datum]
 
     def step(self, closure=None):
         """Performs a single optimization step.
@@ -72,25 +92,10 @@ class MPI_PS(torch.optim.SGD):
             nesterov = group['nesterov']
             assert len(self.names) == len(group['params'])
 
-            recv_msgs = {}
-            igather_data = []
-            for name, param in zip(self.names, group['params']):
-                start = time.time()
-                msg = self.encode(param.grad.data, cuda=self.cuda, **self.encode_kwargs)
-                data['encode_time'] += time.time() - start
-                start = time.time()
-                if self.use_mpi:
-                    *r, igather_datum = comms.igather(msg, name=name)
-                    recv_msgs[name] = r
-                    igather_data += [{'name': name, **igather_datum}]
-                else:
-                    recv_msgs[name] = msg
-                    igather_data = []
-                data['igather_time'] += time.time() - start
-            data['igather_data'] = igather_data
-
             sent_msgs = []
-            for ((name, recv_msg), p) in zip(recv_msgs.items(), group['params']):
+            for p in group['params']:
+                name = p.name
+                recv_msg = self.recv_msgs[name]
                 if self.rank == 0:
                     if self.use_mpi:
                         start = time.time()
@@ -138,11 +143,19 @@ class MPI_PS(torch.optim.SGD):
                     sent_msgs += [comms.ibroadcast(p.data)]
                 data['ibroadcast_time'] += time.time() - start
             data['param_comm_time'] = 0
+            start = time.time()
             if self.use_mpi:
                 for sent_msg, p in zip(sent_msgs, group['params']):
                     start = time.time()
                     p.data = comms.irecv1(*sent_msg, cuda=self.cuda)
             data['param_comm_time'] += time.time() - start
+        if len(self.timings) > 0:
+            timings = reduce(lambda x, y: {k: x[k] + y[k]
+                                           for k in x.keys()}, self.timings)
+            timings = {'_' + k: v for k, v in timings.items()}
+            data.update(timings)
 
         data['opt_time'] = time.time() - for_loop_start
+        self.recv_msgs = {}
+        self.timings = []
         return loss, data
