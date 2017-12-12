@@ -22,7 +22,7 @@ def compress(msg, level=3, name='blosclz'):
         raise ValueError('Do not specify lz4 or snappy. I ran into hard to '
                          'debug issues when I did this. blosclz seems to work')
     code = blosc.compress(msg, clevel=level, cname=name)
-    return code
+    return bytearray(code)
 
 def decompress(code):
     msg = blosc.decompress(code)
@@ -78,8 +78,8 @@ def igather(obj, name=""):
 
     send += bytearray(b'\x29'*32)
 
-    max_bytes[name] = max(max_bytes.get(name, 0), (len(send) + 1) * 1)
-    max_bytes[name] = max(max_bytes[name], 1024 * 30)
+    max_bytes[name] = max(max_bytes.get(name, 0), (len(send) + 1) * 4)
+    max_bytes[name] = max(max_bytes[name], 1024 * 3)
     #  print(len(send), max_bytes[name])
     recv = bytearray(max_bytes[name] * size)
     #  print(max_bytes[name])
@@ -109,14 +109,10 @@ def irecv(recv, req, name="", cuda=False):
         req.Wait()
         bytes_ = max_bytes[name]
         msgs = [recv[bytes_*n:bytes_*(n+1)] for n in range(size)]
-        msgs = [trim_msg(msg) for msg in msgs]
-        msgs = [decompress(msg) for msg in msgs]
-        objs = [pickle.loads(msg) for msg in msgs]
-        objs = [to_torch(obj, cuda=cuda) for obj in objs]
-        #  msgs = map(trim_msg, msgs)
-        #  msgs = map(blosc.decompress, msgs)
-        #  objs = map(pickle.loads, msgs)
-        #  objs = map(functools.partial(to_torch, cuda=cuda), objs)
+        msgs = map(trim_msg, msgs)
+        msgs = map(blosc.decompress, msgs)
+        objs = map(pickle.loads, msgs)
+        objs = map(functools.partial(to_torch, cuda=cuda), objs)
         return list(objs)
 
 
