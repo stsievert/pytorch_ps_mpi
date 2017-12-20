@@ -78,8 +78,8 @@ def igather(obj, name=""):
 
     send += bytearray(b'\x29'*32)
 
-    max_bytes[name] = max(max_bytes.get(name, 0), (len(send) + 1) * 4)
-    max_bytes[name] = max(max_bytes[name], 1024 * 3)
+    max_bytes[name] = max(max_bytes.get(name, 0), (len(send) + 1) * 10)
+    max_bytes[name] = max(max_bytes[name], 1024 * 15)
     #  print(len(send), max_bytes[name])
     recv = bytearray(max_bytes[name] * size)
     #  print(max_bytes[name])
