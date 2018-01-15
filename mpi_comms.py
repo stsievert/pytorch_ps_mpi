@@ -131,16 +131,60 @@ def ibroadcast(obj):
     req = comm.Ibcast([send, MPI.BYTE])
     return send, req
 
+def to_mpi_v(v, counts, dtype=MPI.BYTE):
+    displacements = [sum(counts[:i]) for i in range(len(counts))]
+    return (v, (counts, displacements), dtype)
+
+
+def to_mpi(v, dtype=MPI.BYTE):
+    return (v, dtype)
+
+
+class Iallgather:
+    def __init__(self):
+        self.comm = MPI.COMM_WORLD
+        self.rank = comm.Get_rank()
+        self.size = comm.Get_size()
+
+    def _get_counts(self, rank_size):
+        rank_size = np.array(rank_size, dtype=np.int16)
+        counts = np.zeros(size, dtype=np.int16)
+        req = self.comm.Iallgather(rank_size, counts)
+        req.Wait()
+        return counts
+
+    def send(self, send):
+        counts = self._get_counts(len(send))
+        recv = bytearray(sum(counts))
+        req = self.comm.Iallgatherv(to_mpi(send), to_mpi_v(recv, counts))
+        return recv, req, counts
+
+    def recv(self, recv, req, counts, cuda=False):
+        displacements = [sum(counts[:i]) for i in range(len(counts))]
+        req.Wait()
+        msgs = [recv[displacements[i]:displacements[i+1]]
+                for i in range(len(displacements) - 1)]
+        msgs += [recv[displacements[-1]:]]
+        msgs = map(blosc.decompress, msgs)
+        objs = map(pickle.loads, msgs)
+        objs = map(functools.partial(to_torch, cuda=cuda), objs)
+        return list(objs)
+
+def format_for_send(obj):
+    code = to_np(obj)
+    pickled = pickle.dumps(code)
+    send = bytearray(pickled)
+    # TODO: get sizes from all other machines here (will reduce the straggler
+    # effect)
+    return compress(send)
 
 if __name__ == "__main__":
-    obj = {rank: rank, 'str': str(rank)}
+    obj = {'rank': rank, 'list': list(range(rank + 1))}
+    send = format_for_send(obj)
 
-    r = ibroadcast(obj)
-    obj_hat = irecv1(*r)
-    assert obj_hat == obj
-
-    *r, data = igather(obj, name="test")
-    if rank == 0:
-        objs = irecv(*r, name="test")
-        for obj_hat in objs:
-            assert obj == obj_hat
+    comm = Iallgather()
+    r = comm.send(send)
+    objs = comm.recv(*r)
+    objs_true = [{'rank': rank, 'list': list(range(rank + 1))}
+                 for rank in range(size)]
+    assert objs == objs_true
