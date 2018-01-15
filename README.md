@@ -79,3 +79,14 @@ for p in params:
 It's easy to impelment inconsistent reads with `ibcast`. It's harder to do
 consistent reads; we need to do a buffered broadcast to allow workers to
 continue to compute gradients.
+
+## Iallgatherv
+I tried playing with `Iallgatherv`. Some problems:
+
+* Does not support sending objects of *unknown* sizes. Every rank needs to know
+  the size of every object it's receiving.
+* Sending the objects of these types involves sending a tuple as shown in [the
+  implementation][allgather-impl] and [the tests][allgather-tests]
+
+[allgather-tests]:https://github.com/mpi4py/mpi4py/blob/bd5278b232bde9f40247c3af1a8aed6166e7cbcf/test/test_cco_nb_vec.py#L192
+[allgather-impl]:https://github.com/mpi4py/mpi4py/blob/3fd4dbd57b54f412e28b84aa6f77fb440c120f7d/test/arrayimpl.py#L99
