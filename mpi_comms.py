@@ -147,8 +147,8 @@ class Iallgather:
         self.size = comm.Get_size()
 
     def _get_counts(self, rank_size):
-        rank_size = np.array(rank_size, dtype=np.int16)
-        counts = np.zeros(size, dtype=np.int16)
+        rank_size = np.array(rank_size, dtype=np.int32)
+        counts = np.zeros(size, dtype=np.int32)
         req = self.comm.Iallgather(rank_size, counts)
         req.Wait()
         return counts
@@ -169,6 +169,16 @@ class Iallgather:
         objs = map(pickle.loads, msgs)
         objs = map(functools.partial(to_torch, cuda=cuda), objs)
         return list(objs)
+
+def print_summary(flat_dict):
+    string = "    {"
+    for k, v in flat_dict.items():
+        if isinstance(v, (torch.Tensor, torch.cuda.FloatTensor, np.ndarray)):
+            string += f"{k}: {v.shape}, "
+        else:
+            string += f"{k}: {v}, "
+    string += "}"
+    print(string)
 
 def format_for_send(obj):
     code = to_np(obj)

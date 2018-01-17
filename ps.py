@@ -7,6 +7,11 @@ __dir__ = "/".join(__file__.split('/')[:-1])
 sys.path.append(__dir__)
 import mpi_comms as comms
 from mpi4py import MPI
+import dask
+import distributed
+import pickle
+from distributed import Client, LocalCluster
+from pprint import pprint
 
 
 def _bytes_of(obj):
@@ -30,16 +35,23 @@ def _bytes_of(obj):
     return sys.getsizeof(obj)  # only counting tensors as stores
 
 
+def find_param(params, name):
+    matches = [p for p in params if p.name == name]
+    if len(matches) > 1:
+        raise ValueError('More than one name found')
+    return matches[0]
+
 class MPI_PS(torch.optim.SGD):
     def __init__(self, named_params, *args,
                  encode=None, decode=None, names=[],
                  encode_kwargs={}, use_mpi=True, cuda=False,
                  **kwargs):
-        for name, param in named_params:
-            param.register_hook(partial(self.send_grad, name=name))
-            param.name = name
         self.encode = encode
         self.decode = decode
+        for i, (name, param) in enumerate(named_params):
+            param.name = name
+            param.register_hook(partial(self.prepare_for_send, name=name,
+                                        encode=self.encode, i=i))
         self.use_mpi = use_mpi
         #  self.compress = kwargs.pop('compress', False)
         #  self.rescale = rescale
@@ -48,26 +60,35 @@ class MPI_PS(torch.optim.SGD):
         self.names = names
         self.cuda = cuda
 
-        comm = MPI.COMM_WORLD
-        self.rank = comm.Get_rank()
-        self.size = comm.Get_size()
+        self.comm = MPI.COMM_WORLD
+        self.rank = self.comm.Get_rank()
+        self.size = self.comm.Get_size()
         self.steps = 0
+        self.iallgather = comms.Iallgather()
         super(MPI_PS, self).__init__(*args, **kwargs)
 
         self.recv_msgs = {}
+        self.msgs = {}
         self.timings = []
+        self.futures = []
+        cluster = LocalCluster(processes=False, n_workers=10)
+        self.client = Client(cluster, processes=False)
 
-    def send_grad(self, grad, name=None):
-        msg, datum = self.encode(grad.data, cuda=self.cuda, **self.encode_kwargs)
-        datum = {'encode_' + k: v for k, v in datum.items()}
-        if self.use_mpi:
-            *r, igather_datum = comms.igather(msg, name=name)
-            self.recv_msgs[name] = r
-        else:
-            self.recv_msgs[name] = msg
-            igather_datum = {}
-        datum.update(igather_datum)
-        self.timings += [datum]
+    def format_for_send(self, grad, name="", **kwargs):
+        code = self.encode(grad, **kwargs)
+        msg = comms.format_for_send(code)
+        return name, msg
+
+    def prepare_for_send(self, grad, name=None, encode=None, i=0):
+        def format_for_send(grad, name=None, i=0, **kwargs):
+            #  return name, grad, i
+            code = encode(grad, **kwargs)
+            msg = comms.format_for_send(code)
+            return name, msg, i
+
+        future = self.client.submit(format_for_send, grad.data, name=name,
+                                    cuda=self.cuda, i=i, **self.encode_kwargs)
+        self.futures += [future]
 
     def step(self, closure=None):
         """Performs a single optimization step.
@@ -80,82 +101,69 @@ class MPI_PS(torch.optim.SGD):
             loss = closure()
 
         self.steps += 1
-        data = {'grad_comm_time': 0, 'msg_size': 0, 'step': self.steps,
-                'encode_time': 0, 'decode_time': 0, 'param_compute_time': 0,
-                'grad_sum_time': 0, 'rank': self.rank, 'world_size': self.size,
-                'igather_time': 0, 'ibroadcast_time': 0}
-        for_loop_start = time.time()
+
+        data = {'encode_wait': 0, 'comm_wait': 0}
         for group in self.param_groups:
             weight_decay = group['weight_decay']
             momentum = group['momentum']
             dampening = group['dampening']
             nesterov = group['nesterov']
-            assert len(self.names) == len(group['params'])
+            if len(set(self.names)) != len(group['params']):
+                raise ValueError('len(set(names)) != len(params)')
 
-            sent_msgs = []
-            for p in group['params']:
-                name = p.name
-                recv_msg = self.recv_msgs[name]
-                if self.rank == 0:
-                    if self.use_mpi:
-                        start = time.time()
-                        codes = comms.irecv(*recv_msg, name=name, cuda=self.cuda)
-                        data['grad_comm_time'] += time.time() - start
-                        data['msg_size'] += _bytes_of(codes)
-
-                        start = time.time()
-                        grad = [self.decode(code, cuda=self.cuda) for code in codes]
-                        data['decode_time'] += time.time() - start
-                    else:
-                        data['grad_comm_time'] += 1e-6
-                        data['msg_size'] += _bytes_of(recv_msg)
-                        start = time.time()
-                        grad = [self.decode(recv_msg, cuda=self.cuda)]
-                        data['decode_time'] += time.time() - start
-
-                    start = time.time()
-                    d_p = sum(grad)
-                    data['grad_sum_time'] += time.time() - start
-
-                    start = time.time()
-                    if p.grad is None:
-                        continue
-                    #  d_p = p.grad.data
-                    if weight_decay != 0:
-                        d_p.add_(weight_decay, p.data)
-                    if momentum != 0:
-                        param_state = self.state[p]
-                        if 'momentum_buffer' not in param_state:
-                            buf = param_state['momentum_buffer'] = torch.zeros_like(p.data)
-                            buf.mul_(momentum).add_(d_p)
-                        else:
-                            buf = param_state['momentum_buffer']
-                            buf.mul_(momentum).add_(1 - dampening, d_p)
-                        if nesterov:
-                            d_p = d_p.add(momentum, buf)
-                        else:
-                            d_p = buf
-
-                    p.data.add_(-group['lr'], d_p)
-                    data['param_compute_time'] += time.time() - start
-                start = time.time()
-                if self.use_mpi:
-                    sent_msgs += [comms.ibroadcast(p.data)]
-                data['ibroadcast_time'] += time.time() - start
-            data['param_comm_time'] = 0
+            responses = {}
             start = time.time()
-            if self.use_mpi:
-                for sent_msg, p in zip(sent_msgs, group['params']):
-                    start = time.time()
-                    p.data = comms.irecv1(*sent_msg, cuda=self.cuda)
-            data['param_comm_time'] += time.time() - start
-        if len(self.timings) > 0:
-            timings = reduce(lambda x, y: {k: x[k] + y[k]
-                                           for k in x.keys()}, self.timings)
-            timings = {'_' + k: v for k, v in timings.items()}
-            data.update(timings)
+            # order = FIFO
 
-        data['opt_time'] = time.time() - for_loop_start
-        self.recv_msgs = {}
-        self.timings = []
+            # send gradients
+            sent_names = []
+            for future in self.futures:
+                name, msg, _ = future.result()
+                responses[name] = self.iallgather.send(msg)
+                sent_names += [name]
+            data['encode_wait'] = time.time() - start
+
+            start = time.time()
+            params_sent = (find_param(group['params'], name)
+                           for p, name in zip(group['params'], sent_names))
+            data['reordering_time'] = time.time() - start
+
+            names = [p.name for p in group['params'][::-1]]
+            if len(names) != len(set(names)):
+                repeated = set([x for x in names if names.count(x) > 1])
+                raise ValueError(f'names not unique. Repeated names = {repeated}')
+
+            for p in params_sent:
+                start = time.time()
+                codes = self.iallgather.recv(*responses[p.name], cuda=self.cuda)
+                data['comm_wait'] += time.time() - start
+                grads = list(map(partial(self.decode, cuda=self.cuda), codes))
+
+                cond = all([g.shape == grads[0].shape for g in grads])
+                if not cond:
+                    print("  !!", self.rank, p.name, [g.shape for g in grads])
+                    raise ValueError('shapes not the same')
+                d_p = sum(grads)
+
+                if p.grad is None:
+                    continue
+                #  d_p = p.grad.data
+                if weight_decay != 0:
+                    d_p.add_(weight_decay, p.data)
+                if momentum != 0:
+                    param_state = self.state[p]
+                    if 'momentum_buffer' not in param_state:
+                        buf = param_state['momentum_buffer'] = torch.zeros_like(p.data)
+                        buf.mul_(momentum).add_(d_p)
+                    else:
+                        buf = param_state['momentum_buffer']
+                        buf.mul_(momentum).add_(1 - dampening, d_p)
+                    if nesterov:
+                        d_p = d_p.add(momentum, buf)
+                    else:
+                        d_p = buf
+
+                p.data.add_(-group['lr'], d_p)
+
+        self.msgs = {}
         return loss, data
