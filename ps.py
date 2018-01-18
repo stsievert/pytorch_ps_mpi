@@ -2,6 +2,7 @@ import torch
 import time
 from functools import partial
 from toolz import reduce
+import os
 import sys
 __dir__ = "/".join(__file__.split('/')[:-1])
 sys.path.append(__dir__)
@@ -12,7 +13,10 @@ import distributed
 import pickle
 from distributed import Client, LocalCluster
 from pprint import pprint
-
+sys.path.append('..')
+sys.path.append('.')
+import svd_comms
+import qsgd
 
 def _bytes_of(obj):
     # BUG: for 2D arrays doesn't return the number of bytes
@@ -41,6 +45,34 @@ def find_param(params, name):
         raise ValueError('More than one name found')
     return matches[0]
 
+def setup_dask_client():
+    """
+    Remotey run
+
+        dask-scheduler --host localhost --port 8786
+        dask-worker --nthreads 2 --nprocs 8 localhost:8786
+        export PYTHONPATH=WideResNet-pytorch:WideResNet-pytorch/pytorch_ps_mpi:$PYTHONPATH
+
+    Or with the cluster.py...
+
+        python cluster.py custom 'killall dask-scheduler'
+        python cluster.py custom 'killall dask-worker'
+
+        python cluster.py custom 'export PYTHONPATH=WideResNet-pytorch:WideResNet-pytorch/pytorch_ps_mpi:$PYTHONPATH'
+
+        python cluster.py custom 'dask-scheduler --host localhost --port 8786 &' &
+        python cluster.py custom 'dask-worker --nthreads 2 --nprocs 8 localhost:8786 &' &
+
+
+    """
+    print("In setup_dask_client")
+    #  os.system('export PYTHONPATH=.:pytorch_ps_mpi:$PYTHONPATH')
+    #  os.system('killall dask-worker')
+    #  os.system('killall dask-scheduler')
+    #  os.system('dask-scheduler --host localhost --port 8786 &')
+    #  os.system('dask-worker --nthreads 2 --nprocs 8 localhost:8786 &')
+    return 'localhost:8786'
+
 class MPI_PS(torch.optim.SGD):
     def __init__(self, named_params, *args,
                  encode=None, decode=None, names=[],
@@ -51,7 +83,8 @@ class MPI_PS(torch.optim.SGD):
         for i, (name, param) in enumerate(named_params):
             param.name = name
             param.register_hook(partial(self.prepare_for_send, name=name,
-                                        encode=self.encode, i=i))
+                                        encode=self.encode,
+                                        format=comms.format_for_send, i=i))
         self.use_mpi = use_mpi
         #  self.compress = kwargs.pop('compress', False)
         #  self.rescale = rescale
@@ -71,23 +104,29 @@ class MPI_PS(torch.optim.SGD):
         self.msgs = {}
         self.timings = []
         self.futures = []
-        cluster = LocalCluster(processes=False, n_workers=10)
-        self.client = Client(cluster, processes=False)
+        #  cluster = LocalCluster(processes=True, n_workers=10)
+        client_host = setup_dask_client()
+        print("Calling distributed.Client...")
+        self.client = Client(client_host)
+        print("self.client assigned")
 
     def format_for_send(self, grad, name="", **kwargs):
-        code = self.encode(grad, **kwargs)
+        code = self.encode(grad.cpu(), **kwargs)
         msg = comms.format_for_send(code)
         return name, msg
 
-    def prepare_for_send(self, grad, name=None, encode=None, i=0):
-        def format_for_send(grad, name=None, i=0, **kwargs):
+    def prepare_for_send(self, grad, name=None, encode=None, i=0, format=None):
+        def format_for_send(grad, name=None, i=0, encode=None, format=None,
+                            **kwargs):
             #  return name, grad, i
-            code = encode(grad, **kwargs)
-            msg = comms.format_for_send(code)
-            return name, msg, i
+            code = encode(grad.cpu(), **kwargs)
+            msg = format(code)
+            return (name, msg)
 
         future = self.client.submit(format_for_send, grad.data, name=name,
-                                    cuda=self.cuda, i=i, **self.encode_kwargs)
+                                    cuda=self.cuda, i=i,
+                                    encode=encode, format=format,
+                                    **self.encode_kwargs)
         self.futures += [future]
 
     def step(self, closure=None):
@@ -103,6 +142,7 @@ class MPI_PS(torch.optim.SGD):
         self.steps += 1
 
         data = {'encode_wait': 0, 'comm_wait': 0}
+        print("In step")
         for group in self.param_groups:
             weight_decay = group['weight_decay']
             momentum = group['momentum']
@@ -117,11 +157,14 @@ class MPI_PS(torch.optim.SGD):
 
             # send gradients
             sent_names = []
+            print("Going through futures....", len(self.futures), self.futures)
             for future in self.futures:
-                name, msg, _ = future.result()
+                print("future:", future)
+                name, msg = future.result()
                 responses[name] = self.iallgather.send(msg)
                 sent_names += [name]
             data['encode_wait'] = time.time() - start
+            print("Done with futures")
 
             start = time.time()
             params_sent = (find_param(group['params'], name)
