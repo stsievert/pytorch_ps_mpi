@@ -8,8 +8,6 @@ __dir__ = "/".join(__file__.split('/')[:-1])
 sys.path.append(__dir__)
 import mpi_comms as comms
 from mpi4py import MPI
-import dask
-import distributed
 import pickle
 from distributed import Client, LocalCluster
 from pprint import pprint
@@ -45,33 +43,6 @@ def find_param(params, name):
         raise ValueError('More than one name found')
     return matches[0]
 
-def setup_dask_client():
-    """
-    Remotey run
-
-        dask-scheduler --host localhost --port 8786
-        dask-worker --nthreads 2 --nprocs 8 localhost:8786
-        export PYTHONPATH=WideResNet-pytorch:WideResNet-pytorch/pytorch_ps_mpi:$PYTHONPATH
-
-    Or with the cluster.py...
-
-        python cluster.py custom 'killall dask-scheduler'
-        python cluster.py custom 'killall dask-worker'
-
-        python cluster.py custom 'export PYTHONPATH=WideResNet-pytorch:WideResNet-pytorch/pytorch_ps_mpi:$PYTHONPATH'
-
-        python cluster.py custom 'dask-scheduler --host localhost --port 8786 &' &
-        python cluster.py custom 'dask-worker --nthreads 2 --nprocs 8 localhost:8786 &' &
-
-
-    """
-    print("In setup_dask_client")
-    #  os.system('export PYTHONPATH=.:pytorch_ps_mpi:$PYTHONPATH')
-    #  os.system('killall dask-worker')
-    #  os.system('killall dask-scheduler')
-    #  os.system('dask-scheduler --host localhost --port 8786 &')
-    #  os.system('dask-worker --nthreads 2 --nprocs 8 localhost:8786 &')
-    return 'localhost:8786'
 
 class MPI_PS(torch.optim.SGD):
     def __init__(self, named_params, *args,
@@ -104,11 +75,6 @@ class MPI_PS(torch.optim.SGD):
         self.msgs = {}
         self.timings = []
         self.futures = []
-        #  cluster = LocalCluster(processes=True, n_workers=10)
-        client_host = setup_dask_client()
-        print("Calling distributed.Client...")
-        self.client = Client(client_host)
-        print("self.client assigned")
 
     def format_for_send(self, grad, name="", **kwargs):
         code = self.encode(grad.cpu(), **kwargs)
@@ -123,10 +89,11 @@ class MPI_PS(torch.optim.SGD):
             msg = format(code)
             return (name, msg)
 
-        future = self.client.submit(format_for_send, grad.data, name=name,
-                                    cuda=self.cuda, i=i,
-                                    encode=encode, format=format,
-                                    **self.encode_kwargs)
+        # TODO: call format_for_send and get a future out
+        #  future = self.client.submit(format_for_send, grad.data, name=name,
+                                    #  cuda=self.cuda, i=i,
+                                    #  encode=encode, format=format,
+                                    #  **self.encode_kwargs)
         self.futures += [future]
 
     def step(self, closure=None):
