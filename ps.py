@@ -15,6 +15,7 @@ sys.path.append('..')
 sys.path.append('.')
 import svd_comms
 import qsgd
+from concurrent.futures import ThreadPoolExecutor
 
 def _bytes_of(obj):
     # BUG: for 2D arrays doesn't return the number of bytes
@@ -75,6 +76,10 @@ class MPI_PS(torch.optim.SGD):
         self.msgs = {}
         self.timings = []
         self.futures = []
+        self.pool = ThreadPoolExecutor(max_workers=10)
+
+    def __exit(self):
+        self.pool.shutdown()
 
     def format_for_send(self, grad, name="", **kwargs):
         code = self.encode(grad.cpu(), **kwargs)
@@ -89,11 +94,14 @@ class MPI_PS(torch.optim.SGD):
             msg = format(code)
             return (name, msg)
 
-        # TODO: call format_for_send and get a future out
-        #  future = self.client.submit(format_for_send, grad.data, name=name,
+        #  future = self.client.submit( format_for_send, grad.data, name=name,
                                     #  cuda=self.cuda, i=i,
                                     #  encode=encode, format=format,
                                     #  **self.encode_kwargs)
+        future = self.pool.submit(format_for_send, grad.data, name=name,
+                                  cuda=self.cuda, i=i,
+                                  encode=encode, format=format,
+                                  **self.encode_kwargs)
         self.futures += [future]
 
     def step(self, closure=None):
@@ -109,7 +117,6 @@ class MPI_PS(torch.optim.SGD):
         self.steps += 1
 
         data = {'encode_wait': 0, 'comm_wait': 0}
-        print("In step")
         for group in self.param_groups:
             weight_decay = group['weight_decay']
             momentum = group['momentum']
@@ -124,14 +131,11 @@ class MPI_PS(torch.optim.SGD):
 
             # send gradients
             sent_names = []
-            print("Going through futures....", len(self.futures), self.futures)
             for future in self.futures:
-                print("future:", future)
                 name, msg = future.result()
                 responses[name] = self.iallgather.send(msg)
                 sent_names += [name]
             data['encode_wait'] = time.time() - start
-            print("Done with futures")
 
             start = time.time()
             params_sent = (find_param(group['params'], name)
