@@ -16,6 +16,7 @@ sys.path.append('.')
 import svd_comms
 import qsgd
 from concurrent.futures import ThreadPoolExecutor
+import concurrent.futures
 
 def _bytes_of(obj):
     # BUG: for 2D arrays doesn't return the number of bytes
@@ -76,7 +77,8 @@ class MPI_PS(torch.optim.SGD):
         self.msgs = {}
         self.timings = []
         self.futures = []
-        self.pool = ThreadPoolExecutor(max_workers=10)
+        self.msgs = {}
+        self.pool = ThreadPoolExecutor(max_workers=100)
 
     def __exit(self):
         self.pool.shutdown()
@@ -89,15 +91,10 @@ class MPI_PS(torch.optim.SGD):
     def prepare_for_send(self, grad, name=None, encode=None, i=0, format=None):
         def format_for_send(grad, name=None, i=0, encode=None, format=None,
                             **kwargs):
-            #  return name, grad, i
             code = encode(grad.cpu(), **kwargs)
             msg = format(code)
-            return (name, msg)
+            self.msgs[name] = msg
 
-        #  future = self.client.submit( format_for_send, grad.data, name=name,
-                                    #  cuda=self.cuda, i=i,
-                                    #  encode=encode, format=format,
-                                    #  **self.encode_kwargs)
         future = self.pool.submit(format_for_send, grad.data, name=name,
                                   cuda=self.cuda, i=i,
                                   encode=encode, format=format,
@@ -116,7 +113,7 @@ class MPI_PS(torch.optim.SGD):
 
         self.steps += 1
 
-        data = {'encode_wait': 0, 'comm_wait': 0}
+        data = {'comm_wait': 0}
         for group in self.param_groups:
             weight_decay = group['weight_decay']
             momentum = group['momentum']
@@ -125,29 +122,28 @@ class MPI_PS(torch.optim.SGD):
             if len(set(self.names)) != len(group['params']):
                 raise ValueError('len(set(names)) != len(params)')
 
-            responses = {}
-            start = time.time()
-            # order = FIFO
+            # Order in order of computation
+            ordered_params = {p.name: p for p in group['params'][::-1]}
 
-            # send gradients
-            sent_names = []
-            for future in self.futures:
-                name, msg = future.result()
-                responses[name] = self.iallgather.send(msg)
-                sent_names += [name]
+            # Wait for all keys to be in self.msgs
+            start = time.time()
+            concurrent.futures.wait(self.futures)
             data['encode_wait'] = time.time() - start
 
+            # send gradients
             start = time.time()
-            params_sent = (find_param(group['params'], name)
-                           for p, name in zip(group['params'], sent_names))
-            data['reordering_time'] = time.time() - start
+            responses = {}
+            for name in ordered_params:
+                responses[name] = self.iallgather.send(self.msgs[name])
+            self.msgs = {}
+            data['isend_time'] = time.time() - start
 
             names = [p.name for p in group['params'][::-1]]
             if len(names) != len(set(names)):
                 repeated = set([x for x in names if names.count(x) > 1])
                 raise ValueError(f'names not unique. Repeated names = {repeated}')
 
-            for p in params_sent:
+            for name, p in ordered_params.items():
                 start = time.time()
                 codes = self.iallgather.recv(*responses[p.name], cuda=self.cuda)
                 data['comm_wait'] += time.time() - start
@@ -179,5 +175,4 @@ class MPI_PS(torch.optim.SGD):
 
                 p.data.add_(-group['lr'], d_p)
 
-        self.msgs = {}
         return loss, data
