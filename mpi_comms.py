@@ -6,6 +6,7 @@ import blosc
 from mpi4py import MPI
 import torch
 import numpy as np
+import time
 
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
@@ -150,11 +151,13 @@ class Iallgather:
         rank_size = np.array(rank_size, dtype=np.int32)
         counts = np.zeros(size, dtype=np.int32)
         req = self.comm.Iallgather(rank_size, counts)
-        req.Wait()
-        return counts
+        return req, counts
 
-    def send(self, send):
-        counts = self._get_counts(len(send))
+    def prepare(self, counts):
+        responses = map(self._get_counts, counts)
+        return list(responses)
+
+    def send(self, send, counts):
         recv = bytearray(sum(counts))
         req = self.comm.Iallgatherv(to_mpi(send), to_mpi_v(recv, counts))
         return recv, req, counts
