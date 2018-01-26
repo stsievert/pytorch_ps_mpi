@@ -15,9 +15,11 @@ sys.path.append('..')
 sys.path.append('.')
 import svd_comms
 import qsgd
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import concurrent.futures
 import cProfile, pstats, io
+#  import multiprocessing as mp
+#  mp.set_start_method('forkserver')
 
 def _bytes_of(obj):
     # BUG: for 2D arrays doesn't return the number of bytes
@@ -86,24 +88,11 @@ class MPI_PS(torch.optim.SGD):
     def __exit(self):
         self.pool.shutdown()
 
-    def format_for_send(self, grad, name="", **kwargs):
-        code = self.encode(grad.cpu(), **kwargs)
-        msg = comms.format_for_send(code)
-        return name, msg
-
-    def prepare_for_send(self, grad, name=None, encode=None, i=0, format=None):
-        def format_for_send(grad, name=None, i=0,
-                            #  encode=None, format=None,
-                            **kwargs):
-            code = encode(grad.cpu(), **kwargs)
-            msg = format(code)
-            self.msgs[name] = msg
-
-        future = self.pool.submit(format_for_send, grad.data, name=name,
-                                  cuda=self.cuda, i=i,
-                                  #  encode=encode, format=format,
-                                  **self.encode_kwargs)
-        self.futures += [future]
+    def format_for_send(self, grad, encode=None, format=comms.format_for_send,
+                        **kwargs):
+        code = encode(grad, **kwargs)
+        msg = format(code)
+        return msg
 
     def step(self, closure=None):
         """Performs a single optimization step.
@@ -128,26 +117,29 @@ class MPI_PS(torch.optim.SGD):
                 raise ValueError('len(set(names)) != len(params)')
 
             # Order in order of computation
-            ordered_params = {p.name: p for p in group['params'][::-1]}
+            ordered_params = [(p.name, p) for p in group['params'][::-1]]
 
             # Wait for all keys to be in self.msgs
+            grads = (p.grad.data.cpu() for name, p in ordered_params)
             start = time.time()
-            concurrent.futures.wait(self.futures)
-            data['encode_wait'] = time.time() - start
+            codes = self.pool.map(partial(self.encode, **self.encode_kwargs),
+                                    grads)
+            #  codes = list(codes)
+            data['code_wait'] = time.time() - start
+
+            start = time.time()
+            msgs = self.pool.map(comms.format_for_send, codes)
+            msgs = list(msgs)
+            data['format_for_send_time'] = time.time() - start
 
             # iallgather.send takes a long time because of stragglers (and it
             # has to send the counts to each machine).
             # To fix this, send all sizes async
 
-            # send gradients
             start = time.time()
-            msgs = [self.msgs[name] for name in ordered_params]
-            self.msgs = {}
-            data['_msg_gather'] = time.time() - start
-
-            start = time.time()
-            sizes = self.iallgather.prepare(map(len, msgs))
+            sizes = self.iallgather.prepare(list(map(len, msgs)))
             data['iallgather_prepare_time'] = time.time() - start
+
             start = time.time()
             responses = []
             for (req, count), msg in zip(sizes, msgs):
@@ -160,7 +152,7 @@ class MPI_PS(torch.optim.SGD):
                 repeated = set([x for x in names if names.count(x) > 1])
                 raise ValueError(f'names not unique. Repeated names = {repeated}')
 
-            for msg, (name, p) in zip(responses, ordered_params.items()):
+            for msg, (name, p) in zip(responses, ordered_params):
                 start = time.time()
                 codes = self.iallgather.recv(*msg, cuda=self.cuda)
                 data['comm_wait'] += time.time() - start
