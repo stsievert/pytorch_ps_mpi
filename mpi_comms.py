@@ -170,7 +170,7 @@ class Iallgather:
         msgs += [recv[displacements[-1]:]]
         msgs = map(blosc.decompress, msgs)
         objs = map(pickle.loads, msgs)
-        objs = map(functools.partial(to_torch, cuda=cuda), objs)
+        objs = map(to_np, objs)
         return list(objs)
 
 def print_summary(flat_dict):
