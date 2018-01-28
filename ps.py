@@ -14,8 +14,7 @@ from distributed import Client, LocalCluster
 from pprint import pprint
 sys.path.append('..')
 sys.path.append('.')
-import svd_comms
-import qsgd
+import codings
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import concurrent.futures
 import cProfile, pstats, io
@@ -52,17 +51,16 @@ def find_param(params, name):
 
 class MPI_PS(torch.optim.SGD):
     def __init__(self, named_params, *args,
-                 encode=None, decode=None, names=[],
-                 encode_kwargs={}, use_mpi=True, cuda=False,
+                 names=[],
+                 code=None,
+                 use_mpi=True, cuda=False,
                  **kwargs):
-        self.call_pre_decode = encode_kwargs.pop('call_pre_decode', False)
-        self.encode = partial(encode, **encode_kwargs)
-        self.decode = decode
+        self.code = code
 
         for i, (name, param) in enumerate(named_params):
             param.name = name
             param.register_hook(partial(self.async_code, name=name,
-                                        encode=self.encode))
+                                        encode=code.encode))
         self.use_mpi = use_mpi
         self.names = names
         self.cuda = cuda
@@ -176,10 +174,8 @@ class MPI_PS(torch.optim.SGD):
                 data['comm_wait'] += time.time() - start
 
                 start = time.time()
-                decode = partial(self.decode, cuda=self.cuda)
-                if self.call_pre_decode:
-                    result = self.pre_decode(codes)
-                    decode = partial(decode, **result)
+                self.code.codes = codes
+                decode = partial(self.code.decode, cuda=self.cuda)
                 grads = map(decode, codes)
                 grads = list(map(comms.to_torch, grads))
                 data['decode_time'] += time.time() - start
