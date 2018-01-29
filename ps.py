@@ -88,7 +88,7 @@ class MPI_PS(torch.optim.SGD):
 
     def format_for_send(self, grad, encode=None, format=comms.format_for_send,
                         **kwargs):
-        code = encode(grad.data.cpu(), **kwargs)
+        code = encode(grad.data.cpu().numpy(), **kwargs)
         msg = format(code)
         return msg
 
