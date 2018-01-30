@@ -47,7 +47,7 @@ def to_torch(d, cuda=False):
     if isinstance(d, np.ndarray):
         d = torch.Tensor(d)
         if cuda:
-            d = d.cuda()
+            d = d.cuda(async=True)
         return d
     if isinstance(d, dict):
         return {k: to_torch(v, cuda=cuda) for k, v in d.items()}

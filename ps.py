@@ -175,9 +175,8 @@ class MPI_PS(torch.optim.SGD):
 
                 start = time.time()
                 self.code.codes = codes
-                decode = partial(self.code.decode, cuda=self.cuda)
-                grads = map(decode, codes)
-                grads = list(map(comms.to_torch, grads))
+                grads = map(self.code.decode, codes)
+                grads = list(map(partial(comms.to_torch, cuda=self.cuda), grads))
                 data['decode_time'] += time.time() - start
 
                 start = time.time()
