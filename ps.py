@@ -4,6 +4,7 @@ from functools import partial
 from toolz import reduce
 import os
 import sys
+import math
 from collections import OrderedDict
 __dir__ = "/".join(__file__.split('/')[:-1])
 sys.path.append(__dir__)
@@ -49,13 +50,15 @@ def find_param(params, name):
     return matches[0]
 
 
-class MPI_PS(torch.optim.SGD):
+class MPI_PS(torch.optim.Optimizer):
     def __init__(self, named_params, *args,
                  names=[],
+                 optim='sgd',
                  code=None,
                  use_mpi=True, cuda=False,
                  **kwargs):
         self.code = code
+        self.optim = optim
 
         for i, (name, param) in enumerate(named_params):
             param.name = name
@@ -88,7 +91,7 @@ class MPI_PS(torch.optim.SGD):
 
     def format_for_send(self, grad, encode=None, format=comms.format_for_send,
                         **kwargs):
-        code = encode(grad.data.cpu().numpy(), **kwargs)
+        code = encode(grad.data, **kwargs)
         msg = format(code)
         return msg
 
@@ -112,29 +115,12 @@ class MPI_PS(torch.optim.SGD):
 
         data = {'comm_wait': 0, 'optim_step_time': 0, 'decode_time': 0}
         for group in self.param_groups:
-            weight_decay = group['weight_decay']
-            momentum = group['momentum']
-            dampening = group['dampening']
-            nesterov = group['nesterov']
             if len(set(self.names)) != len(group['params']):
                 raise ValueError('len(set(names)) != len(params)')
 
             # Order in order of computation
             ordered_params = OrderedDict([(p.name, p)
                                           for p in group['params'][::-1]])
-
-            # Wait for all keys to be in self.msgs
-            #  grads = (p.grad.data.cpu() for name, p in ordered_params)
-            #  start = time.time()
-            #  codes = self.pool.map(partial(self.encode, **self.encode_kwargs),
-                                    #  grads)
-            #  codes = list(codes)
-            #  data['code_wait'] = time.time() - start
-
-            #  start = time.time()
-            #  msgs = self.pool.map(comms.format_for_send, codes)
-            #  msgs = list(msgs)
-            #  data['format_for_send_time'] = time.time() - start
 
             # iallgather.send takes a long time because of stragglers (and it
             # has to send the counts to each machine).
@@ -175,7 +161,7 @@ class MPI_PS(torch.optim.SGD):
 
                 start = time.time()
                 self.code.codes = codes
-                grads = map(self.code.decode, codes)
+                grads = map(partial(self.code.decode, cuda=self.cuda), codes)
                 grads = list(map(partial(comms.to_torch, cuda=self.cuda), grads))
                 data['decode_time'] += time.time() - start
 
@@ -190,22 +176,84 @@ class MPI_PS(torch.optim.SGD):
                 if p.grad is None:
                     continue
                 #  d_p = p.grad.data
-                if weight_decay != 0:
-                    d_p.add_(weight_decay, p.data)
-                if momentum != 0:
-                    param_state = self.state[p]
-                    if 'momentum_buffer' not in param_state:
-                        buf = param_state['momentum_buffer'] = torch.zeros_like(p.data)
-                        buf.mul_(momentum).add_(d_p)
-                    else:
-                        buf = param_state['momentum_buffer']
-                        buf.mul_(momentum).add_(1 - dampening, d_p)
-                    if nesterov:
-                        d_p = d_p.add(momentum, buf)
-                    else:
-                        d_p = buf
+                if self.optim == 'sgd':
+                    kwargs = {k: group[k] for k in ['weight_decay', 'momentum',
+                                                    'dampening', 'nesterov', 'lr']}
+                elif self.optim == 'adam':
+                    kwargs = {k: group[k] for k in ['betas', 'weight_decay',
+                                                    'eps', 'lr']}
+                else:
+                    raise ValueError('self.optim not in [sgd, adam]')
 
-                p.data.add_(-group['lr'], d_p)
+                self.optim_step(p, d_p, **kwargs)
                 data['optim_step_time'] += time.time() - start
 
         return loss, data
+
+class SGD(MPI_PS, torch.optim.SGD):
+
+    def optim_step(self, p, d_p, weight_decay=0, momentum=0, dampening=0,
+                   nesterov=0, lr=0):
+        if weight_decay != 0:
+            d_p.add_(weight_decay, p.data)
+        if momentum != 0:
+            param_state = self.state[p]
+            if 'momentum_buffer' not in param_state:
+                buf = param_state['momentum_buffer'] = torch.zeros_like(p.data)
+                buf.mul_(momentum).add_(d_p)
+            else:
+                buf = param_state['momentum_buffer']
+                buf.mul_(momentum).add_(1 - dampening, d_p)
+            if nesterov:
+                d_p = d_p.add(momentum, buf)
+            else:
+                d_p = buf
+
+        p.data.add_(-lr, d_p)
+
+
+class Adam(MPI_PS, torch.optim.Adam):
+    def optim_step(self, p, grad, amsgrad=False, betas=[0.9, 0.999], weight_decay=0,
+                  eps=1e-8, lr=1e-3):
+        if grad.is_sparse:
+            raise RuntimeError('Adam does not support sparse gradients, please consider SparseAdam instead')
+
+        state = self.state[p]
+
+        # State initialization
+        if len(state) == 0:
+            state['step'] = 0
+            # Exponential moving average of gradient values
+            state['exp_avg'] = torch.zeros_like(p.data)
+            # Exponential moving average of squared gradient values
+            state['exp_avg_sq'] = torch.zeros_like(p.data)
+            if amsgrad:
+                # Maintains max of all exp. moving avg. of sq. grad. values
+                state['max_exp_avg_sq'] = torch.zeros_like(p.data)
+
+        exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+        if amsgrad:
+            max_exp_avg_sq = state['max_exp_avg_sq']
+        beta1, beta2 = betas
+
+        state['step'] += 1
+
+        if weight_decay != 0:
+            grad = grad.add(weight_decay, p.data)
+
+        # Decay the first and second moment running average coefficient
+        exp_avg.mul_(beta1).add_(1 - beta1, grad)
+        exp_avg_sq.mul_(beta2).addcmul_(1 - beta2, grad, grad)
+        if amsgrad:
+            # Maintains the maximum of all 2nd moment running avg. till now
+            torch.max(max_exp_avg_sq, exp_avg_sq, out=max_exp_avg_sq)
+            # Use the max. for normalizing running avg. of gradient
+            denom = max_exp_avg_sq.sqrt().add_(eps)
+        else:
+            denom = exp_avg_sq.sqrt().add_(eps)
+
+        bias_correction1 = 1 - beta1 ** state['step']
+        bias_correction2 = 1 - beta2 ** state['step']
+        step_size = lr * math.sqrt(bias_correction2) / bias_correction1
+
+        p.data.addcdiv_(-step_size, exp_avg, denom)

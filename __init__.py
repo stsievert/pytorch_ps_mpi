@@ -1,1 +1,1 @@
-from .ps import MPI_PS
+from .ps import MPI_PS, Adam, SGD
