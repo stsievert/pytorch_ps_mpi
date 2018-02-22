@@ -16,6 +16,7 @@ from pprint import pprint
 sys.path.append('..')
 sys.path.append('.')
 import codings
+import numpy as np
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import concurrent.futures
 import cProfile, pstats, io
@@ -50,12 +51,18 @@ def find_param(params, name):
     return matches[0]
 
 
+def decode_grads(codes, decode=None, cuda=False):
+    grads = [decode(x, cuda=cuda) for x in codes]
+    grads = [comms.to_torch(x, cuda=cuda) for x in grads]
+    return grads
+
 class MPI_PS(torch.optim.Optimizer):
     def __init__(self, named_params, *args,
                  names=[],
                  optim='sgd',
                  code=None,
                  use_mpi=True, cuda=False,
+                 encode_kwargs={},
                  **kwargs):
         self.code = code
         self.optim = optim
@@ -92,7 +99,9 @@ class MPI_PS(torch.optim.Optimizer):
     def format_for_send(self, grad, encode=None, format=comms.format_for_send,
                         **kwargs):
         code = encode(grad.data, **kwargs)
+        code.update({'_norm(grad)**2': torch.norm(grad.data)**2})
         msg = format(code)
+
         return msg
 
     def async_code(self, grad, *args, name=None, **kwargs):
@@ -154,18 +163,31 @@ class MPI_PS(torch.optim.Optimizer):
                            for name, msg, r in zip(self.names, msgs, responses)]
             self.names = []
             self.futures = []
+            _truth_var = 0
+            _est_var = 0
+            decode_futures = {}
+            _decode_grads = partial(decode_grads, decode=self.code.decode,
+                                    cuda=self.cuda)
+            data['decode_send_time'] = 0
             for name, p, msg, response in paired_info:
                 start = time.time()
                 codes = self.iallgather.recv(*response, cuda=self.cuda)
                 data['comm_wait'] += time.time() - start
 
-                start = time.time()
                 self.code.codes = codes
-                grads = map(partial(self.code.decode, cuda=self.cuda), codes)
-                grads = list(map(partial(comms.to_torch, cuda=self.cuda), grads))
+                start = time.time()
+                decode_futures[name] = self.pool.submit(_decode_grads, codes)
+                data['decode_send_time'] += time.time() - start
+
+            for name, p, msg, future in paired_info:
+                start = time.time()
+                grads = decode_futures[name].result()
                 data['decode_time'] += time.time() - start
+                d_p = sum(grads)
 
                 start = time.time()
+                _truth_var += np.mean([code['_norm(grad)**2'] for code in codes])
+                _est_var += np.mean([torch.norm(g)**2 for g in grads])
 
                 cond = all([g.shape == grads[0].shape for g in grads])
                 if not cond:
@@ -188,6 +210,8 @@ class MPI_PS(torch.optim.Optimizer):
                 self.optim_step(p, d_p, **kwargs)
                 data['optim_step_time'] += time.time() - start
 
+        data['grad_variance_increase'] = _est_var / _truth_var
+        data['steps'] = self.steps
         return loss, data
 
 class SGD(MPI_PS, torch.optim.SGD):
