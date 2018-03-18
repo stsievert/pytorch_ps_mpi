@@ -139,6 +139,7 @@ class MPI_PS(torch.optim.Optimizer):
             #  msgs = concurrent.futures.wait(self.futures)
             #  print(msgs, type(msgs[0]))
             msgs = list(msgs)
+            data['svd_rank'] = sum(msg.get('rank', -1) for msg in msgs) / len(msgs)
             data['code_wait'] = time.time() - start
 
             start = time.time()
