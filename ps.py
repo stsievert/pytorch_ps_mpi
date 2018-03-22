@@ -56,14 +56,15 @@ class MPI_PS(torch.optim.Optimizer):
                  optim='sgd',
                  code=None,
                  use_mpi=True, cuda=False,
+                 compress_level=None,
                  **kwargs):
         self.code = code
         self.optim = optim
-
+	
         for i, (name, param) in enumerate(named_params):
             param.name = name
             param.register_hook(partial(self.async_code, name=name,
-                                        encode=code.encode))
+                                        encode=code.encode, level=compress_level))
         self.use_mpi = use_mpi
         self.names = names
         self.cuda = cuda
@@ -90,9 +91,9 @@ class MPI_PS(torch.optim.Optimizer):
         self.pool.shutdown()
 
     def format_for_send(self, grad, encode=None, format=comms.format_for_send,
-                        **kwargs):
+                        level=None, **kwargs):
         code = encode(grad.data, **kwargs)
-        msg, data = format(code)
+        msg, data = format(code, level=level)
         return msg, data
 
     def async_code(self, grad, *args, name=None, **kwargs):
