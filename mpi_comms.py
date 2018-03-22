@@ -183,11 +183,11 @@ def print_summary(flat_dict):
     string += "}"
     print(string)
 
-def format_for_send(obj):
+def format_for_send(obj, **kwargs):
     code = to_np(obj)
     pickled = pickle.dumps(code)
     send = bytearray(pickled)
     # TODO: get sizes from all other machines here (will reduce the straggler
     # effect)
-    packaged = compress(send)
+    packaged = compress(send, **kwargs)
     return packaged, {'msg_bytes': len(send), 'packaged_bytes':len(packaged)}
