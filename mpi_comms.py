@@ -15,7 +15,7 @@ size = comm.Get_size()
 max_bytes = {}
 
 
-def compress(msg, level=3, name='blosclz'):
+def compress(msg, level=0, name='blosclz'):
     """
     Compress a message.
     """
@@ -189,15 +189,5 @@ def format_for_send(obj):
     send = bytearray(pickled)
     # TODO: get sizes from all other machines here (will reduce the straggler
     # effect)
-    return compress(send)
-
-if __name__ == "__main__":
-    obj = {'rank': rank, 'list': list(range(rank + 1))}
-    send = format_for_send(obj)
-
-    comm = Iallgather()
-    r = comm.send(send)
-    objs = comm.recv(*r)
-    objs_true = [{'rank': rank, 'list': list(range(rank + 1))}
-                 for rank in range(size)]
-    assert objs == objs_true
+    packaged = compress(send)
+    return packaged, {'msg_bytes': len(send), 'packaged_bytes':len(packaged)}
